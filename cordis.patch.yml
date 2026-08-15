@@ -1,0 +1,30 @@
+- insert:
+    - id: shell-plugin-local
+      name: '@local/dsh-shell-plugin'
+      disabled: !!js process.platform !== 'win32'
+      config:
+        shells:
+          cmd:
+            enabled: true
+            codePage: 65001
+            cols: 160
+            rows: 40
+            maxOutputBytes: 64000
+            graceMs: 3000
+          bash:
+            enabled: true
+            executable: 'D:\Scoop\apps\git\current\git-bash.exe'
+            lang: C.UTF-8
+            maxOutputBytes: 64000
+            maxSpillBytes: 67108864
+            graceMs: 3000
+
+# This plugin owns the Windows shell surface: the SYSTEM PowerShell tool
+# (`@deepseek-ai/dsh-tool-pwsh`, mounted by dsh-base on win32) is disabled
+# host-wide so the model-facing shell is bash-only (PowerShell does not fit
+# the model's RL/tool environment). The `pwsh-sandbox` EXECUTOR stays:
+# permission-presets and the hooks bridges hard-inject `ctx.shell`. A
+# deployment that wants PowerShell back can either remove this row or enable
+# this plugin's own `shells.pwsh` (independent of the system tool).
+- id: tool-pwsh
+  disabled: true
