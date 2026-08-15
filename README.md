@@ -14,7 +14,7 @@ source instead of being decoded from a guessed redirected-pipe encoding.
 
 `bash` runs Git for Windows' non-GUI `bin/bash.exe` with a clean UTF-8 locale.
 Configuration may point at either `bin/bash.exe` directly or the familiar
-`git-bash.exe`; the latter is deliberately resolved to the adjacent
+   D:\Scoop\apps\git\current\git-bash.exe，改成你机器上 Git for Windows
 `bin/bash.exe` so the GUI launcher is never spawned.
 
 `pwsh` spawns a real PowerShell process through the same subprocess seam,
@@ -166,3 +166,36 @@ First-principles stance, mirrored by the implementation:
 
 The contract is asserted by the `every shell tool description teaches
 exit-code semantics` test.
+
+## Installation
+
+复制下面的指令块给你的 DSH agent，它会自动完成安装：
+
+```text
+请安装 Windows Shell 插件（@local/dsh-shell-plugin）：
+
+1. 前置：本机已有 deepseek-harness 源码（本插件 link 依赖其中的 dsh-tools 包，
+   位于 <deepseek-harness>/packages/core/tools）；且运行环境为 Windows。
+2. 克隆仓库：
+   git clone https://github.com/DoiiarX/dsh-shell-plugin
+   cd dsh-shell-plugin
+3. 安装依赖：pnpm install
+   （如果 package.json 里 dsh-tools 的 link 路径与你机器不符，改成你的
+   deepseek-harness 实际路径后再装。）
+4. 检查 cordis.patch.yml 里的 bash 路径：默认硬编码为
+   D:\Scoop\apps\git\current\git-bash.exe，改成你机器上 Git for Windows
+   的实际 bash 路径（bin/bash.exe 或 git-bash.exe 均可，但建议指向 bin/bash.exe
+   避免拉起 GUI 启动器）。
+5. 挂进 web profile：编辑 $HOME/.dsh/profiles/web/package.json，
+   在 dependencies 加 "@local/dsh-shell-plugin": "link:<本插件目录绝对路径>"，
+   在 dsh.profile.bundles 加 "@local/dsh-shell-plugin"。
+6. 在 profile 目录执行 pnpm install。
+7. 暴露设置页：在 <deepseek-harness>/packages/host/apiproxy/src/api-proxy.ts
+   的 WEB_SETTINGS_NAMESPACES 数组加 "local-shell-tools"。
+8. 重 build host（pnpm run build:lib:host）并重启 web 进程。
+9. 验证：工具列表出现 bash（可选 cmd/pwsh），设置页出现 Shell 小节。
+```
+
+注意：本插件挂载后会禁用 harness 的系统 PowerShell 工具（tool-pwsh），使
+模型面向的 shell 默认只留 bash；如需 PowerShell 请改 cordis.patch.yml 或
+在设置页开启 `shells.pwsh`。本插件仅 Windows 可用。
