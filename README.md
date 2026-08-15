@@ -1,5 +1,7 @@
 # DSH configurable Windows shells
 
+> [English](README.md) | [中文](README.zh.md)
+
 > 本插件属于 [dsh-plugins](https://github.com/DoiiarX/dsh-plugins) 合集，完整的自研插件索引见该仓库。
 
 Local DeepSeek Harness bundle that owns the Windows shell surface: it can
