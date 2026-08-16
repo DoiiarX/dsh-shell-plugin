@@ -1,6 +1,6 @@
 - insert:
     - id: shell-plugin-local
-      name: '@local/dsh-shell-plugin'
+      name: '@doiiarx/dsh-shell-plugin'
       disabled: !!js process.platform !== 'win32'
       config:
         shells:

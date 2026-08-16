@@ -1,5 +1,5 @@
 window.__ModuleLoader__.load({
-  id: "@local/dsh-shell-plugin",
+  id: "@doiiarx/dsh-shell-plugin",
   factory: (require) => {
     const module = { exports: {} };
     const React = require("react");

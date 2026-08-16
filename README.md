@@ -174,7 +174,7 @@ exit-code semantics` test.
 复制下面的指令块给你的 DSH agent，它会自动完成安装：
 
 ```text
-请安装 Windows Shell 插件（@local/dsh-shell-plugin）：
+请安装 Windows Shell 插件（@doiiarx/dsh-shell-plugin）：
 
 1. 前置：本机已有 deepseek-harness 源码（本插件 link 依赖其中的 dsh-tools 包，
    位于 <deepseek-harness>/packages/core/tools）；且运行环境为 Windows。
@@ -189,8 +189,8 @@ exit-code semantics` test.
    的实际 bash 路径（bin/bash.exe 或 git-bash.exe 均可，但建议指向 bin/bash.exe
    避免拉起 GUI 启动器）。
 5. 挂进 web profile：编辑 $HOME/.dsh/profiles/web/package.json，
-   在 dependencies 加 "@local/dsh-shell-plugin": "link:<本插件目录绝对路径>"，
-   在 dsh.profile.bundles 加 "@local/dsh-shell-plugin"。
+   在 dependencies 加 "@doiiarx/dsh-shell-plugin": "link:<本插件目录绝对路径>"，
+   在 dsh.profile.bundles 加 "@doiiarx/dsh-shell-plugin"。
 6. 在 profile 目录执行 pnpm install。
 7. 暴露设置页：在 <deepseek-harness>/packages/host/apiproxy/src/api-proxy.ts
    的 WEB_SETTINGS_NAMESPACES 数组加 "local-shell-tools"。
