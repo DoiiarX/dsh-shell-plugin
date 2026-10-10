@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { applyIsolated } from './index.js'
+import { applyIsolated, apply, Config, materializeConfig } from './index.js'
+import { Readable } from 'node:stream'
 import { applyShells, normalizeTerminalText, presentShellCall, presentShellResult, resolveBashExecutable, resolvePwshExecutable, shellAvailabilityText, startBackground } from './implementation.js'
 
 test('git-bash.exe resolves to the non-GUI bash.exe', () => {
@@ -253,37 +254,524 @@ test('shellAvailabilityText lists enabled and disabled shells', () => {
 })
 
 test('shellAvailabilityText is empty when every shell is enabled', () => {
-  assert.equal(shellAvailabilityText({ cmdEnabled: true, bashEnabled: true, pwshEnabled: true, persistentEnabled: false }), '')
+  assert.equal(shellAvailabilityText({ cmdEnabled: true, bashEnabled: true, pwshEnabled: true, wslEnabled: true, persistentEnabled: false }), '')
 })
 
 test('shellAvailabilityText handles the no-enabled edge without a misleading list', () => {
-  const text = shellAvailabilityText({ cmdEnabled: false, bashEnabled: false, pwshEnabled: false, persistentEnabled: false })
+  const text = shellAvailabilityText({ cmdEnabled: false, bashEnabled: false, pwshEnabled: false, wslEnabled: false, persistentEnabled: false })
   assert.match(text, /当前没有启用的 shell 工具/)
   assert.match(text, /不得调用/)
 })
 
-test('applyShells registers the shell:availability section and re-reads live settings', () => {
+test('applyShells renders availability from the current entry config', () => {
   const sections = []
-  let live = { cmdEnabled: false, bashEnabled: true, pwshEnabled: false, persistentEnabled: false }
   applyShells({
     tools: { register() {} },
     provide() {},
     get(name) { return name === 'shellMiddlewareSlot' ? { list: () => [] } : undefined },
     systemPrompt: { section(section) { sections.push(section) } },
   }, {
-    shells: { cmd: { enabled: false }, bash: { enabled: true, executable: 'D:\\Scoop\\apps\\git\\current\\git-bash.exe' }, pwsh: { enabled: false } },
-  }, () => {}, () => live)
+    shells: {
+      cmd: { enabled: false },
+      bash: { enabled: true, executable: 'D:\\Scoop\\apps\\git\\current\\git-bash.exe' },
+      pwsh: { enabled: false },
+      wsl: { enabled: false },
+    },
+  }, () => {})
   assert.equal(sections.length, 1)
   assert.equal(sections[0].name, 'shell:availability')
   assert.equal(sections[0].order, 110)
   assert.match(sections[0].text(), /启用的 shell 工具：bash/)
-  assert.match(sections[0].text(), /未启用的 shell 工具：cmd、pwsh/)
-  // Live settings win over the startup config: pwsh and cmd both flip to
-  // enabled, leaving nothing to constrain.
-  live = { cmdEnabled: true, bashEnabled: true, pwshEnabled: true, persistentEnabled: false }
-  assert.equal(sections[0].text(), '')
-  // A failed read falls back to the startup config instead of throwing.
-  live = null
-  assert.match(sections[0].text(), /启用的 shell 工具：bash/)
-  assert.match(sections[0].text(), /未启用的 shell 工具：cmd、pwsh/)
+  assert.match(sections[0].text(), /未启用的 shell 工具：cmd、pwsh、wsl/)
+})
+
+test('shells.env entries are injected into every bash spawn, layered over the UTF-8 locale', async () => {
+  const spawns = []
+  let bashTool
+  const makeCollected = (isProbe) => ({
+    stdout: { readFrom: () => ({ text: isProbe ? 'dsh-probe-ok' : '', lossy: false }) },
+    stderr: { readFrom: () => ({ text: '', lossy: false }) },
+  })
+  const ctx = {
+    tools: { register(tool) { if (tool.name === 'bash') bashTool = tool } },
+    provide() {},
+    get(name) { return name === 'shellMiddlewareSlot' ? { list: () => [] } : undefined },
+    subprocess: {
+      spawn: (spec) => {
+        spawns.push(spec)
+        return { done: Promise.resolve({ exitCode: 0, signal: null }), collected: makeCollected(spec.argv.some((a) => a.includes('dsh-probe-ok'))) }
+      },
+    },
+    sandboxPolicy: { resolve: () => ({ mode: 'danger-full-access' }) },
+  }
+  applyShells(ctx, {
+    shells: {
+      cmd: { enabled: false },
+      bash: { enabled: true, executable: 'D:\\Scoop\\apps\\git\\current\\git-bash.exe', lang: 'C.UTF-8' },
+      pwsh: { enabled: false },
+      env: { PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' },
+    },
+  }, () => {})
+  await bashTool.execute({ command: "echo hi", description: "probe" }, { signal: new AbortController().signal })
+  assert.equal(spawns.length, 2)
+  assert.deepEqual(spawns[1].env, { LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8', PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' })
+})
+
+test('an explicit shells.env LANG overrides the bash default locale', async () => {
+  const spawns = []
+  let bashTool
+  const makeCollected = (isProbe) => ({
+    stdout: { readFrom: () => ({ text: isProbe ? 'dsh-probe-ok' : '', lossy: false }) },
+    stderr: { readFrom: () => ({ text: '', lossy: false }) },
+  })
+  const ctx = {
+    tools: { register(tool) { if (tool.name === 'bash') bashTool = tool } },
+    provide() {},
+    get(name) { return name === 'shellMiddlewareSlot' ? { list: () => [] } : undefined },
+    subprocess: {
+      spawn: (spec) => {
+        spawns.push(spec)
+        return { done: Promise.resolve({ exitCode: 0, signal: null }), collected: makeCollected(spec.argv.some((a) => a.includes('dsh-probe-ok'))) }
+      },
+    },
+    sandboxPolicy: { resolve: () => ({ mode: 'danger-full-access' }) },
+  }
+  applyShells(ctx, {
+    shells: {
+      cmd: { enabled: false },
+      bash: { enabled: true, executable: 'D:\\Scoop\\apps\\git\\current\\git-bash.exe', lang: 'C.UTF-8' },
+      pwsh: { enabled: false },
+      env: { LANG: 'en_US.UTF-8' },
+    },
+  }, () => {})
+  await bashTool.execute({ command: 'true', description: 'probe' }, { signal: new AbortController().signal })
+  assert.equal(spawns[0].env.LANG, 'en_US.UTF-8')
+  assert.equal(spawns[0].env.LC_ALL, 'C.UTF-8')
+})
+
+test('shells.env rejects a non-map value or an empty key', () => {
+  const registered = []
+  assert.throws(() => applyShells(
+    { tools: { register(tool) { registered.push(tool.name) } }, provide() {} },
+    { shells: { cmd: { enabled: true }, env: ['PYTHONIOENCODING', 'utf-8'] } },
+    () => {},
+  ), /shells\.env must be a map/)
+  assert.throws(() => applyShells(
+    { tools: { register(tool) { registered.push(tool.name) } }, provide() {} },
+    { shells: { cmd: { enabled: true }, env: { '': 'x' } } },
+    () => {},
+  ), /keys must be non-empty/)
+  assert.throws(() => applyShells(
+    { tools: { register(tool) { registered.push(tool.name) } }, provide() {} },
+    { shells: { cmd: { enabled: true }, env: { PYTHONIOENCODING: 42 } } },
+    () => {},
+  ), /must be a string/)
+})
+
+test('Config covers the profile patch fields and materializes nested values', () => {
+  const patch = {
+    shells: {
+      cmd: { enabled: false, codePage: 65001, cols: 160, rows: 40, maxOutputBytes: 64000, graceMs: 3000 },
+      bash: {
+        enabled: true,
+        executable: 'D:\\Scoop\\apps\\git\\current\\git-bash.exe',
+        lang: 'C.UTF-8',
+        maxOutputBytes: 64000,
+        maxSpillBytes: 67108864,
+        graceMs: 3000,
+        probe: true,
+      },
+      wsl: {
+        enabled: true,
+        maxOutputBytes: 64000,
+        maxSpillBytes: 67108864,
+        graceMs: 3000,
+        probeTimeoutMs: 15000,
+        probe: true,
+      },
+      env: { PYTHONIOENCODING: 'utf-8' },
+    },
+    persistent: { enabled: true, backend: 'bash' },
+  }
+  const parsed = materializeConfig(Config(patch))
+  const expected = {
+    'shells.cmd.enabled': false,
+    'shells.cmd.codePage': 65001,
+    'shells.cmd.cols': 160,
+    'shells.cmd.rows': 40,
+    'shells.cmd.maxOutputBytes': 64000,
+    'shells.cmd.graceMs': 3000,
+    'shells.bash.enabled': true,
+    'shells.bash.executable': 'D:\\Scoop\\apps\\git\\current\\git-bash.exe',
+    'shells.bash.lang': 'C.UTF-8',
+    'shells.bash.maxOutputBytes': 64000,
+    'shells.bash.maxSpillBytes': 67108864,
+    'shells.bash.graceMs': 3000,
+    'shells.bash.probe': true,
+    'shells.wsl.enabled': true,
+    'shells.wsl.maxOutputBytes': 64000,
+    'shells.wsl.maxSpillBytes': 67108864,
+    'shells.wsl.graceMs': 3000,
+    'shells.wsl.probeTimeoutMs': 15000,
+    'shells.wsl.probe': true,
+    'shells.env.PYTHONIOENCODING': 'utf-8',
+    'persistent.enabled': true,
+    'persistent.backend': 'bash',
+  }
+  for (const [path, expectedValue] of Object.entries(expected)) {
+    let value = parsed
+    for (const key of path.split('.')) value = value?.[key]
+    assert.equal(value, expectedValue, path)
+  }
+})
+
+test('apply configures the settings policy and uses nested entry config env for bash', async () => {
+  const exe = 'D:/Scoop/apps/git/current/git-bash.exe'
+  const spawns = []
+  let bashTool
+  let settingsPolicy
+  let settingsOwner
+  const makeCollected = (isProbe) => ({
+    stdout: { readFrom: () => ({ text: isProbe ? 'dsh-probe-ok' : '', lossy: false }) },
+    stderr: { readFrom: () => ({ text: '', lossy: false }) },
+  })
+  const ctx = {
+    fiber: { id: 'shell-plugin-local' },
+    root: { logger: () => ({ error: () => {} }) },
+    tools: { register(tool) { if (tool.name === 'bash') bashTool = tool } },
+    inject(services, callback) {
+      if (services.length !== 1 || services[0] !== 'settings') throw new Error('unexpected inject request')
+      callback({
+        settings: { configure(policy, owner) { settingsPolicy = policy; settingsOwner = owner; return () => {} } },
+        effect(effect) { effect(); return () => {} },
+      })
+    },
+    provide() {},
+    get(name) { return name === 'shellMiddlewareSlot' ? { list: () => [] } : undefined },
+    sandboxPolicy: { resolve: () => ({ mode: 'danger-full-access' }) },
+    subprocess: {
+      spawn: (spec) => {
+        spawns.push(spec)
+        return { done: Promise.resolve({ exitCode: 0, signal: null }), collected: makeCollected(spec.argv.some((a) => a.includes('dsh-probe-ok'))) }
+      },
+    },
+  }
+  await apply(ctx, {
+    shells: {
+      cmd: { enabled: false },
+      bash: { enabled: true, executable: exe, lang: 'C.UTF-8' },
+      pwsh: { enabled: false },
+      wsl: { enabled: false },
+      env: { PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1', LANG: 'en_US.UTF-8' },
+    },
+    persistent: { enabled: false },
+  })
+  assert.deepEqual(settingsPolicy, { auto: false })
+  assert.equal(settingsOwner, ctx.fiber)
+  assert.equal(typeof bashTool, 'object')
+  await bashTool.execute({ command: 'true', description: 'probe' }, { signal: new AbortController().signal })
+  assert.equal(spawns.length, 2)
+  assert.deepEqual(spawns[1].env, {
+    LANG: 'en_US.UTF-8',
+    LC_ALL: 'C.UTF-8',
+    PYTHONIOENCODING: 'utf-8',
+    PYTHONUTF8: '1',
+  })
+})
+
+test('wsl tools register when shells.wsl.enabled is true (and not otherwise)', () => {
+  const registered = []
+  const ctx = {
+    tools: { register(tool) { registered.push(tool.name) } },
+    provide() {},
+    get() { return undefined },
+    systemPrompt: { section() {} },
+  }
+  const result = applyShells(ctx, {
+    shells: {
+      cmd: { enabled: false },
+      bash: { enabled: true, executable: 'D:/Scoop/apps/git/current/git-bash.exe' },
+      pwsh: { enabled: false },
+      wsl: { enabled: true },
+    },
+  }, () => {})
+  assert.ok(registered.includes('wsl_probe'), 'wsl_probe registered')
+  assert.ok(registered.includes('wsl_info'), 'wsl_info registered')
+  assert.ok(registered.includes('wsl_exec'), 'wsl_exec registered')
+  assert.ok(registered.includes('wsl_path'), 'wsl_path registered')
+  assert.ok(registered.includes('bash'), 'bash still registered')
+  assert.deepEqual(result.registered.filter((r) => r.startsWith('wsl')), ['wsl_exec'])
+
+  const without = []
+  applyShells({
+    tools: { register(tool) { without.push(tool.name) } },
+    provide() {},
+    get() { return undefined },
+    systemPrompt: { section() {} },
+  }, {
+    shells: {
+      cmd: { enabled: false },
+      bash: { enabled: true, executable: 'D:/Scoop/apps/git/current/git-bash.exe' },
+    },
+  }, () => {})
+  assert.ok(!without.includes('wsl_exec'), 'wsl tools absent when wsl disabled')
+})
+
+test('wsl-enabled config satisfies the at-least-one-shell check', () => {
+  const registered = []
+  const ctx = {
+    tools: { register(tool) { registered.push(tool.name) } },
+    provide() {},
+    get() { return undefined },
+    systemPrompt: { section() {} },
+  }
+  const result = applyShells(ctx, {
+    shells: { cmd: { enabled: false }, bash: { enabled: false }, pwsh: { enabled: false }, wsl: { enabled: true } },
+  }, () => {})
+  assert.notDeepEqual(result, { registered: [], failed: ['configuration'] })
+  assert.ok(registered.includes('wsl_exec'))
+})
+
+test('shell availability text names wsl as enabled or disabled', () => {
+  const enabled = shellAvailabilityText({ cmdEnabled: false, bashEnabled: true, pwshEnabled: false, wslEnabled: true })
+  assert.ok(enabled.includes('bash') && enabled.includes('wsl'), 'enabled line lists bash and wsl')
+  const disabled = shellAvailabilityText({ cmdEnabled: true, bashEnabled: true, pwshEnabled: true, wslEnabled: false })
+  assert.ok(disabled.includes('未启用的 shell 工具：wsl'), 'disabled line names wsl')
+})
+
+test('wsl_exec fails fast on probe failure without running the command', async () => {
+  const spawnArgs = []
+  let wslTool
+  const ctx = {
+    tools: { register(tool) { if (tool.name === 'wsl_exec') wslTool = tool } },
+    provide() {},
+    get(name) { return name === 'shellMiddlewareSlot' ? { list: () => [] } : undefined },
+    sandboxPolicy: { resolve: () => ({ mode: 'danger-full-access' }) },
+    subprocess: {
+      spawn(spec) {
+        spawnArgs.push(spec.argv)
+        return {
+          stdout: Readable.from(['不存在具有所提供名称的分发。\r\n']),
+          stderr: Readable.from([]),
+          done: Promise.resolve({ exitCode: 4294967295, signal: null }),
+        }
+      },
+    },
+  }
+  applyShells(ctx, { shells: { cmd: { enabled: false }, bash: { enabled: false }, wsl: { enabled: true } } }, () => {})
+  assert.equal(typeof wslTool, 'object')
+  const result = await wslTool.execute({ argv: ['echo', 'should-not-run'], distro: 'nope' }, { signal: new AbortController().signal })
+  assert.equal(result.status, 'probe-failed')
+  assert.equal(result.probe.ok, false)
+  assert.equal(spawnArgs.length, 1, 'only the probe spawns')
+  assert.ok(spawnArgs[0].includes('printf'), 'probe runs printf')
+})
+
+test('wsl_exec runs the command after a successful probe and reports the probe phase', async () => {
+  const spawnArgs = []
+  let wslTool
+  const ctx = {
+    tools: { register(tool) { if (tool.name === 'wsl_exec') wslTool = tool } },
+    provide() {},
+    get(name) { return name === 'shellMiddlewareSlot' ? { list: () => [] } : undefined },
+    sandboxPolicy: { resolve: () => ({ mode: 'danger-full-access' }) },
+    subprocess: {
+      spawn(spec) {
+        spawnArgs.push(spec.argv)
+        const probe = spec.argv.includes('printf')
+        return {
+          stdout: Readable.from(probe ? ['wslctl-probe-ok'] : ['hello wsl\n']),
+          stderr: Readable.from([]),
+          done: Promise.resolve({ exitCode: 0, signal: null }),
+        }
+      },
+    },
+  }
+  applyShells(ctx, { shells: { cmd: { enabled: false }, bash: { enabled: false }, wsl: { enabled: true } } }, () => {})
+  const result = await wslTool.execute({ argv: ['echo', 'hello'] }, { signal: new AbortController().signal })
+  assert.equal(result.status, 'exited')
+  assert.equal(result.stdout.trim(), 'hello wsl')
+  assert.equal(result.probe.ok, true)
+  assert.equal(spawnArgs.length, 2, 'probe then command')
+  assert.ok(spawnArgs[1].includes('bash'), 'command runs through bash -s')
+})
+
+test('wsl_exec with probe:false skips the probe entirely', async () => {
+  const spawnArgs = []
+  let wslTool
+  const ctx = {
+    tools: { register(tool) { if (tool.name === 'wsl_exec') wslTool = tool } },
+    provide() {},
+    get(name) { return name === 'shellMiddlewareSlot' ? { list: () => [] } : undefined },
+    sandboxPolicy: { resolve: () => ({ mode: 'danger-full-access' }) },
+    subprocess: {
+      spawn(spec) {
+        spawnArgs.push(spec.argv)
+        return { stdout: Readable.from(['direct\n']), stderr: Readable.from([]), done: Promise.resolve({ exitCode: 0, signal: null }) }
+      },
+    },
+  }
+  applyShells(ctx, { shells: { cmd: { enabled: false }, bash: { enabled: false }, wsl: { enabled: true } } }, () => {})
+  const result = await wslTool.execute({ argv: ['echo', 'direct'], probe: false }, { signal: new AbortController().signal })
+  assert.equal(result.status, 'exited')
+  assert.equal(result.stdout.trim(), 'direct')
+  assert.equal(result.probe, null)
+  assert.equal(spawnArgs.length, 1)
+})
+
+test('bash channel probe fails fast without running the command', async () => {
+  const spawnArgs = []
+  let bashTool
+  const ctx = {
+    tools: { register(tool) { if (tool.name === 'bash') bashTool = tool } },
+    provide() {},
+    get(name) { return name === 'shellMiddlewareSlot' ? { list: () => [] } : undefined },
+    sandboxPolicy: { resolve: () => ({ mode: 'danger-full-access' }) },
+    subprocess: {
+      spawn(spec) {
+        spawnArgs.push(spec.argv)
+        return {
+          done: Promise.resolve({ exitCode: 1, signal: null }),
+          collected: {
+            stdout: { readFrom: () => ({ text: '', lossy: false }) },
+            stderr: { readFrom: () => ({ text: 'no such file', lossy: false }) },
+          },
+        }
+      },
+    },
+  }
+  applyShells(ctx, { shells: { bash: { enabled: true, executable: process.execPath } } }, () => {})
+  assert.equal(typeof bashTool, 'object')
+  const out = await bashTool.execute({ command: 'echo hi', description: 'x' }, { signal: new AbortController().signal })
+  assert.match(out, /\[probe failed\] bash/)
+  assert.equal(spawnArgs.length, 1, 'only the probe spawns')
+})
+
+test('bash channel probe succeeds then the command runs', async () => {
+  const spawnArgs = []
+  let bashTool
+  const ctx = {
+    tools: { register(tool) { if (tool.name === 'bash') bashTool = tool } },
+    provide() {},
+    get(name) { return name === 'shellMiddlewareSlot' ? { list: () => [] } : undefined },
+    sandboxPolicy: { resolve: () => ({ mode: 'danger-full-access' }) },
+    subprocess: {
+      spawn(spec) {
+        spawnArgs.push(spec.argv)
+        const isProbe = spec.argv.some((a) => a.includes('dsh-probe-ok'))
+        return {
+          done: Promise.resolve({ exitCode: 0, signal: null }),
+          collected: {
+            stdout: { readFrom: () => ({ text: isProbe ? 'dsh-probe-ok' : 'hi\n', lossy: false }) },
+            stderr: { readFrom: () => ({ text: '', lossy: false }) },
+          },
+        }
+      },
+    },
+  }
+  applyShells(ctx, { shells: { bash: { enabled: true, executable: process.execPath } } }, () => {})
+  const out = await bashTool.execute({ command: 'echo hi', description: 'x' }, { signal: new AbortController().signal })
+  assert.match(out, /hi/)
+  assert.equal(spawnArgs.length, 2, 'probe then command')
+  assert.ok(spawnArgs[0].some((a) => a.includes('dsh-probe-ok')), 'probe runs printf dsh-probe-ok')
+})
+
+test('bash probe:false skips the probe entirely', async () => {
+  const spawnArgs = []
+  let bashTool
+  const ctx = {
+    tools: { register(tool) { if (tool.name === 'bash') bashTool = tool } },
+    provide() {},
+    get(name) { return name === 'shellMiddlewareSlot' ? { list: () => [] } : undefined },
+    sandboxPolicy: { resolve: () => ({ mode: 'danger-full-access' }) },
+    subprocess: {
+      spawn(spec) {
+        spawnArgs.push(spec.argv)
+        return {
+          done: Promise.resolve({ exitCode: 0, signal: null }),
+          collected: {
+            stdout: { readFrom: () => ({ text: 'hi\n', lossy: false }) },
+            stderr: { readFrom: () => ({ text: '', lossy: false }) },
+          },
+        }
+      },
+    },
+  }
+  applyShells(ctx, { shells: { bash: { enabled: true, executable: process.execPath } } }, () => {})
+  const out = await bashTool.execute({ command: 'echo hi', description: 'x', probe: false }, { signal: new AbortController().signal })
+  assert.match(out, /hi/)
+  assert.equal(spawnArgs.length, 1)
+})
+
+test('pwsh does not probe by default (default off)', async () => {
+  const spawnArgs = []
+  let pwshTool
+  const ctx = {
+    tools: { register(tool) { if (tool.name === 'pwsh') pwshTool = tool } },
+    provide() {},
+    get(name) { return name === 'shellMiddlewareSlot' ? { list: () => [] } : undefined },
+    sandboxPolicy: { resolve: () => ({ mode: 'danger-full-access' }) },
+    subprocess: {
+      spawn(spec) {
+        spawnArgs.push(spec.argv)
+        return {
+          done: Promise.resolve({ exitCode: 0, signal: null }),
+          collected: {
+            stdout: { readFrom: () => ({ text: '', lossy: false }) },
+            stderr: { readFrom: () => ({ text: '', lossy: false }) },
+          },
+        }
+      },
+    },
+  }
+  applyShells(ctx, { shells: { pwsh: { enabled: true, executable: process.execPath } } }, () => {})
+  const out = await pwshTool.execute({ command: 'Write-Output hi', description: 'x' }, { signal: new AbortController().signal })
+  assert.equal(out, '(no output)')
+  assert.equal(spawnArgs.length, 1, 'no probe spawn for pwsh by default')
+})
+
+test('wsl_path preserves Windows backslashes through bash stdin', async () => {
+  const spawns = []
+  let pathTool
+  const ctx = {
+    tools: { register(tool) { if (tool.name === 'wsl_path') pathTool = tool } },
+    provide() {},
+    get(name) { return name === 'shellMiddlewareSlot' ? { list: () => [] } : undefined },
+    sandboxPolicy: { resolve: () => ({ mode: 'danger-full-access' }) },
+    subprocess: {
+      spawn(spec) {
+        spawns.push(spec)
+        return {
+          stdout: Readable.from(['/mnt/d/Programs/deepseek-harness\n']),
+          stderr: Readable.from([]),
+          done: Promise.resolve({ exitCode: 0, signal: null }),
+        }
+      },
+    },
+  }
+  applyShells(ctx, { shells: { cmd: { enabled: false }, bash: { enabled: false }, pwsh: { enabled: false }, wsl: { enabled: true } } }, () => {})
+  const result = await pathTool.execute({ path: 'D:\\Programs\\deepseek-harness', direction: 'windows-to-wsl' }, { signal: new AbortController().signal })
+  assert.deepEqual(result, { path: '/mnt/d/Programs/deepseek-harness', kind: 'drvfs' })
+  assert.equal(spawns.length, 1)
+  assert.ok(spawns[0].argv.includes('bash'))
+  assert.match(spawns[0].stdio.stdin.data, /'D:\\Programs\\deepseek-harness'/)
+})
+
+test('wsl_probe tool guard outlives the configured probe deadline', () => {
+  let probeTool
+  const ctx = {
+    tools: { register(tool) { if (tool.name === 'wsl_probe') probeTool = tool } },
+    provide() {},
+    get() { return undefined },
+    systemPrompt: { section() {} },
+  }
+  applyShells(ctx, {
+    shells: {
+      cmd: { enabled: false },
+      bash: { enabled: false },
+      pwsh: { enabled: false },
+      wsl: { enabled: true, probeTimeoutMs: 15000 },
+    },
+  }, () => {})
+  assert.equal(probeTool.timeoutMs, 20000)
 })

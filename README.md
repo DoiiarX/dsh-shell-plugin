@@ -30,6 +30,29 @@ encoding/session settings. All three accept `run_in_background: true`
 (fire-and-forget via `ctx.jobs`), and the optional `persistent.enabled`
 config exposes a per-agent persistent `shell_session` tool.
 
+### Common environment injection (`shells.env` / settings page)
+
+Environment variables injected into **every command** across all three shells
+(and the persistent session) — the PyCharm-style "environment variables"
+preset, independent of any single shell. The **Shell settings page exposes a
+key=value editor** (the `环境变量` field, persisted at path `shells.env` in
+the `shell-plugin-local` entry config); deployments can also seed defaults in
+`cordis.patch.yml`:
+
+```yaml
+shells:
+  env:
+    PYTHONIOENCODING: 'utf-8'   # Python stdio writes UTF-8, not the GBK console code page
+    PYTHONUTF8: '1'             # Python 3.7+ UTF-8 mode
+```
+
+`bash` still layers its `lang` default (`LANG`/`LC_ALL`, default `C.UTF-8`)
+underneath, so an explicit `LANG` entry overrides the default locale; `cmd`
+and `pwsh` inherit only the entries (their console code page is handled by
+`shells.cmd.codePage` and the `-Command` UTF-8 output preamble respectively).
+Invalid values fail loud at load: the map must hold non-empty string keys with
+string values.
+
 ## Failure isolation
 
 The bundle's root Loader entry imports only a dependency-free supervisor.
@@ -73,26 +96,69 @@ Configuration fields mirror `bash`: `executable` (defaults to the first
 existing of `pwsh.exe` under Program Files, Windows PowerShell 5.1 under
 System32, then PATH), `maxOutputBytes`, `maxSpillBytes`, `graceMs`.
 
-The settings page (Shell section) exposes both controls: `cmdEnabled`,
-`bashEnabled`, `pwshEnabled` and `pwshExecutable` are persisted to the
-`local-shell-tools` settings namespace and merged into the tool configuration
-on the next DSH restart. A deployment that wants the SYSTEM PowerShell tool
+The settings page (Shell section) exposes the corresponding nested fields
+(`shells.cmd.enabled`, `shells.bash.enabled`, `shells.pwsh.enabled`,
+`shells.pwsh.executable`, ...). They are persisted directly into the
+`shell-plugin-local` entry config and take effect on the next DSH restart. A deployment that wants the SYSTEM PowerShell tool
 back removes the `tool-pwsh` row from this bundle's `cordis.patch.yml`; a
 deployment that wants only this plugin's PowerShell enables `shells.pwsh`
 instead.
 
 ## Background execution (fire-and-forget)
 
-Every registered shell tool (`cmd`, `bash`, `pwsh`) accepts `run_in_background:
-true`. The call registers the process with the harness `ctx.jobs` service and
-returns immediately with a job id (`started background job <id>`); the model
-can then poll with `job_output` (or `job_output` with `wait: true`) and stop
-with `job_kill`. When the process settles, the jobs service delivers a
-completion notice to the owning session automatically — the fire-and-forget
-pattern for long-running commands.
+Every registered shell tool (`cmd`, `bash`, `pwsh`, `wsl_exec`) accepts
+`run_in_background: true`. The call registers the process with the harness
+`ctx.jobs` service and returns immediately with a job id (`started background
+job <id>`); the model can then poll with `job_output` (or `job_output` with
+`wait: true`) and stop with `job_kill`. When the process settles, the jobs
+service delivers a completion notice to the owning session automatically — the
+fire-and-forget pattern for long-running commands.
 
 Background processes are fenced by the owning agent (agent disposal cancels
 and awaits them) and are killed/joined when the plugin fiber tears down.
+
+## Channel probes
+
+Every shell tool (`bash`, `cmd`, `pwsh`, `wsl_exec`) can run a fast channel
+probe before the real command: one lightweight command prints a marker
+(`printf dsh-probe-ok` for bash, `echo dsh-probe-ok` for cmd,
+`Write-Output dsh-probe-ok` for pwsh, `printf wslctl-probe-ok` inside the
+distro for wsl). On failure the tool returns immediately (`[probe failed]
+<dialect> channel unavailable: <diagnosis>`, or `probe-failed` for wsl)
+instead of waiting for the command timeout — a broken executable or channel
+costs seconds, not minutes.
+
+Probing is an optional switch per shell: `shells.<name>.probe` (defaults:
+`bash` and `wsl` on, `cmd` and `pwsh` off, matching the shells enabled by
+default), a per-call `probe: true|false` argument that overrides the config
+for that call, and the settings page exposes all four `*Probe` toggles. The
+wsl probe additionally warms up the distro, so the command that follows
+avoids the cold-start wait.
+
+## WSL support (`shells.wsl.enabled`)
+
+`shells.wsl.enabled: true` registers four structured WSL control tools:
+
+- `wsl_info` — enumerate distros, states, default distro, and WSL version
+  (parses `wsl.exe -l -v`, handling its UTF-16LE console output);
+- `wsl_exec` — run a command in a WSL distro, with two modes: `argv` (a
+  parameter array, no shell interpretation — recommended) or `script` (a shell
+  script passed over stdin, no command-line escaping). `cwd` accepts Windows
+  paths (auto-converted to `/mnt/<drive>`) or WSL paths; `env` is exported
+  inside the script; supports `run_in_background: true` like the other shells;
+- `wsl_path` — bidirectional path conversion via in-WSL `wslpath`
+  (`D:\foo` → `/mnt/d/foo`, `/home/x` → `\\wsl.localhost\<distro>\...`);
+- `wsl_probe` — fast channel probe (~1-3s) for long-task preflight.
+
+`wsl_exec` defaults to a channel probe before the real command: the probe
+(`wsl.exe -d <distro> -- printf wslctl-probe-ok`, configurable through
+`shells.wsl.probeTimeoutMs`, default 15s) warms up the distro and fails fast — a missing distro returns `probe-failed` with the
+`WSL_E_DISTRO_NOT_FOUND` diagnosis instead of waiting for the command timeout.
+The command result carries the `probe` field, so the model reads the probe
+phase and the command phase separately. Pass `probe: false` to skip it.
+
+WSL tools return structured JSON (unlike the text-returning cmd/bash/pwsh):
+`{ status, exitCode, signal, stdout, stderr, durationMs, distro, resolvedCwd, probe }`.
 
 ## Persistent shell sessions
 
@@ -120,19 +186,17 @@ To keep the "enabled set" authoritative, the plugin registers a
 `shell:availability` system-prompt section that constrains the model to the
 shells this deployment actually enabled.
 
-The section lists the enabled shells (`cmd`/`bash`/`pwsh`, plus `shell_session`
-when `persistent.enabled`), names the disabled ones, and forbids calling any
-shell outside the enabled set even when its tool is present in the catalog.
-The paragraph only renders when at least one shell is disabled; when every
-shell is enabled nothing needs constraining and the section contributes no
-text.
+The section lists the enabled shells (`cmd`/`bash`/`pwsh`/`wsl`, plus
+`shell_session` when `persistent.enabled`), names the disabled ones, and
+forbids calling any shell outside the enabled set even when its tool is
+present in the catalog. The paragraph only renders when at least one shell is
+disabled; when every shell is enabled nothing needs constraining and the
+section contributes no text.
 
-Mirroring the `user:language` injection pattern, the section text is
-re-evaluated at every prompt assembly from the live `local-shell-tools`
-settings, so toggling `cmdEnabled`/`bashEnabled`/`pwshEnabled` in the settings
-page changes the constraint on the next turn without a restart. Any settings
-read failure degrades to the startup config, and any evaluation failure
-degrades to an empty paragraph — the injection never breaks the prompt.
+The section text is derived from the entry Config when the plugin loads, so
+toggling the shell enable flags in the settings page changes the constraint
+after the entry is reloaded/restarted. Any evaluation failure degrades to an
+empty paragraph — the injection never breaks the prompt.
 
 ## Input / output previews
 
@@ -192,8 +256,8 @@ exit-code semantics` test.
    在 dependencies 加 "@doiiarx/dsh-shell-plugin": "link:<本插件目录绝对路径>"，
    在 dsh.profile.bundles 加 "@doiiarx/dsh-shell-plugin"。
 6. 在 profile 目录执行 pnpm install。
-7. 暴露设置页：在 <deepseek-harness>/packages/host/apiproxy/src/api-proxy.ts
-   的 WEB_SETTINGS_NAMESPACES 数组加 "local-shell-tools"。
+7. 0.2 会从插件的 `Config` 和 entry id `shell-plugin-local` 自动派生设置段；
+   无需再向 host 的 settings namespace allowlist 添加旧命名空间。
 8. 重 build host（pnpm run build:lib:host）并重启 web 进程。
 9. 验证：工具列表出现 bash（可选 cmd/pwsh），设置页出现 Shell 小节。
 ```

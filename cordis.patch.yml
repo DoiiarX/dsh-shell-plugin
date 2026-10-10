@@ -18,6 +18,21 @@
             maxOutputBytes: 64000
             maxSpillBytes: 67108864
             graceMs: 3000
+            # Fast channel probe before each command (default on for bash).
+            probe: true
+          wsl:
+            # Optional WSL control tools (wsl_info / wsl_exec / wsl_path /
+            # wsl_probe). Off by default; a deployment enables it by setting
+            # enabled: true here or in a later patch (the whole row config is
+            # replaced by the later patch, so restate every field).
+            enabled: false
+            maxOutputBytes: 64000
+            maxSpillBytes: 67108864
+            graceMs: 3000
+            probeTimeoutMs: 15000
+            # Fast channel probe + distro warm-up before each command
+            # (default on for wsl).
+            probe: true
 
 # This plugin owns the Windows shell surface: the SYSTEM PowerShell tool
 # (`@deepseek-ai/dsh-tool-pwsh`, mounted by dsh-base on win32) is disabled

@@ -1,8 +1,65 @@
 /** Failure-isolating Loader entry for optional Windows shell tools. */
+import z from '@deepseek-ai/schemastery'
+
 export const name = 'tool-windows-shells-supervisor'
 export const inject = ['tools', 'subprocess', 'sandboxPolicy', 'settings', 'systemPrompt']
 
-const SETTINGS_NS = 'local-shell-tools'
+const VOLATILE_WRITE = Symbol.for('cosmokit.volatile.write')
+
+/**
+ * Plugin configuration, and therefore the settings section, is the entry's
+ * Config schema. Fields under the two object-level `.volatile()` nodes are
+ * live, path-editable profile configuration; apply materializes their snapshots
+ * before passing plain values to the implementation.
+ */
+export const Config = z.object({
+  shells: z.object({
+    cmd: z.object({
+      enabled: z.boolean().default(true),
+      executable: z.string(),
+      codePage: z.number().min(1).default(65001),
+      cols: z.number().min(1).default(160),
+      rows: z.number().min(1).default(40),
+      maxOutputBytes: z.number().min(1024).max(16777216).default(64000),
+      graceMs: z.number().min(100).max(60000).default(3000),
+      probe: z.boolean().default(false),
+      toolName: z.string(),
+    }).default({}),
+    bash: z.object({
+      enabled: z.boolean().default(false),
+      executable: z.string(),
+      lang: z.string().default('C.UTF-8'),
+      maxOutputBytes: z.number().min(1024).max(16777216).default(64000),
+      maxSpillBytes: z.number().min(1048576).max(1073741824).default(67108864),
+      graceMs: z.number().min(100).max(60000).default(3000),
+      probe: z.boolean().default(true),
+      toolName: z.string(),
+    }).default({}),
+    pwsh: z.object({
+      enabled: z.boolean().default(false),
+      executable: z.string(),
+      maxOutputBytes: z.number().min(1024).max(16777216).default(64000),
+      maxSpillBytes: z.number().min(1048576).max(1073741824).default(67108864),
+      graceMs: z.number().min(100).max(60000).default(3000),
+      probe: z.boolean().default(false),
+      toolName: z.string(),
+    }).default({}),
+    wsl: z.object({
+      enabled: z.boolean().default(false),
+      maxOutputBytes: z.number().min(1024).max(16777216).default(64000),
+      maxSpillBytes: z.number().min(1048576).max(1073741824).default(67108864),
+      graceMs: z.number().min(100).max(60000).default(3000),
+      probeTimeoutMs: z.number().min(100).max(60000).default(15000),
+      probe: z.boolean().default(true),
+      toolName: z.string(),
+    }).default({}),
+    env: z.dict(z.string()).default({}),
+  }).default({}).volatile(),
+  persistent: z.object({
+    enabled: z.boolean().default(false),
+    backend: z.union(['bash', 'cmd', 'pwsh']),
+  }).default({}).volatile(),
+})
 
 function diagnostic(scope, error) {
   const detail = error instanceof Error ? `${error.name}: ${error.message}` : String(error)
@@ -16,52 +73,27 @@ function report(ctx, scope, error) {
   console.error(message)
 }
 
-function baseSettings(config) {
-  const cmd = config.shells?.cmd ?? {}
-  const bash = config.shells?.bash ?? {}
-  const pwsh = config.shells?.pwsh ?? {}
-  return {
-    cmdEnabled: cmd.enabled === true,
-    bashEnabled: bash.enabled === true,
-    bashExecutable: bash.executable ?? '',
-    bashLang: bash.lang ?? 'C.UTF-8',
-    pwshEnabled: pwsh.enabled === true,
-    pwshExecutable: pwsh.executable ?? '',
-    maxOutputBytes: bash.maxOutputBytes ?? 64000,
-    maxSpillBytes: bash.maxSpillBytes ?? 67108864,
-    graceMs: bash.graceMs ?? 3000,
-  }
+function isVolatileRef(value) {
+  return value !== null && typeof value === 'object'
+    && VOLATILE_WRITE in value && typeof value.get === 'function'
 }
 
-function mergeSettings(config, settings) {
-  const shells = config.shells ?? {}
-  return {
-    ...config,
-    shells: {
-      ...shells,
-      cmd: { ...(shells.cmd ?? {}), enabled: settings.cmdEnabled },
-      bash: {
-        ...(shells.bash ?? {}),
-        enabled: settings.bashEnabled,
-        executable: settings.bashExecutable || undefined,
-        lang: settings.bashLang,
-        maxOutputBytes: settings.maxOutputBytes,
-        maxSpillBytes: settings.maxSpillBytes,
-        graceMs: settings.graceMs,
-      },
-      pwsh: {
-        ...(shells.pwsh ?? {}),
-        enabled: settings.pwshEnabled,
-        executable: settings.pwshExecutable || undefined,
-      },
-    },
+/** Convert schemastery live references into the plain Config shape used by implementation.js. */
+export function materializeConfig(value) {
+  if (isVolatileRef(value)) return materializeConfig(value.get())
+  if (Array.isArray(value)) return value.map(materializeConfig)
+  if (value !== null && typeof value === 'object') {
+    const result = {}
+    for (const [key, child] of Object.entries(value)) result[key] = materializeConfig(child)
+    return result
   }
+  return value
 }
 
-export async function applyIsolated(ctx, config = {}, importer = () => import('./implementation.js'), readSettings = undefined) {
+export async function applyIsolated(ctx, config = {}, importer = () => import('./implementation.js')) {
   try {
     const implementation = await importer()
-    implementation.applyShells(ctx, config, (scope, error) => { report(ctx, scope, error) }, readSettings)
+    implementation.applyShells(ctx, materializeConfig(config), (scope, error) => { report(ctx, scope, error) })
   } catch (error) {
     report(ctx, 'implementation', error)
   }
@@ -69,33 +101,12 @@ export async function applyIsolated(ctx, config = {}, importer = () => import('.
 
 export async function apply(ctx, config = {}) {
   try {
-    // `schemastery` is a CommonJS-style module whose named export surface is
-    // absent under ESM interop: the usable entry is the `default` export
-    // (`Schema.object` etc.). Destructuring `{ Schema }` yields undefined and
-    // every schema build fails — which previously fell into the catch below,
-    // silently leaving the `local-shell-tools` settings namespace unregistered
-    // and the settings page's Shell section stuck on "reading configuration".
-    const { default: SchemaModule } = await import('schemastery')
-    const Schema = SchemaModule?.Schema ?? SchemaModule
-    if (typeof Schema?.object !== 'function') {
-      throw new Error(`schemastery export shape unexpected: ${typeof Schema}`)
-    }
-    const base = baseSettings(config)
-    const schema = Schema.object({
-      cmdEnabled: Schema.boolean().default(base.cmdEnabled),
-      bashEnabled: Schema.boolean().default(base.bashEnabled),
-      bashExecutable: Schema.string().default(base.bashExecutable),
-      bashLang: Schema.string().default(base.bashLang),
-      pwshEnabled: Schema.boolean().default(base.pwshEnabled),
-      pwshExecutable: Schema.string().default(base.pwshExecutable),
-      maxOutputBytes: Schema.number().min(1024).max(16777216).default(base.maxOutputBytes),
-      maxSpillBytes: Schema.number().min(1048576).max(1073741824).default(base.maxSpillBytes),
-      graceMs: Schema.number().min(100).max(60000).default(base.graceMs),
+    // This package ships its own settings page, so suppress the generated one.
+    ctx.inject(['settings'], (child) => {
+      child.effect(() => child.settings.configure({ auto: false }, ctx.fiber))
     })
-    const scope = ctx.settings.register(SETTINGS_NS, schema, { base })
-    return applyIsolated(ctx, mergeSettings(config, scope.get()), undefined, () => scope.get())
   } catch (error) {
-    report(ctx, 'settings', error)
-    return applyIsolated(ctx, config)
+    report(ctx, 'settings-policy', error)
   }
+  return applyIsolated(ctx, config)
 }

@@ -23,8 +23,8 @@ const DEFAULT_ROWS = 40
  * the catalog (a preset or host row can still mount a system tool this plugin
  * does not own, e.g. `@deepseek-ai/dsh-tool-pwsh`).
  *
- * @param flags - flattened enable flags (the `local-shell-tools` settings
- *   shape, plus `persistentEnabled` for the shell_session tool).
+ * @param flags - flattened enable flags derived from the current entry Config,
+ *   plus `persistentEnabled` for the shell_session tool.
  * @returns the constraint paragraph, or '' when every shell is enabled
  *   (nothing to constrain; empty sections are skipped by renderPrompt).
  */
@@ -35,6 +35,7 @@ export function shellAvailabilityText(flags) {
   push('cmd', flags.cmdEnabled === true)
   push('bash', flags.bashEnabled === true)
   push('pwsh', flags.pwshEnabled === true)
+  push('wsl', flags.wslEnabled === true)
   if (flags.persistentEnabled === true) enabled.push('shell_session')
   if (disabled.length === 0) return ''
   const enabledLine = enabled.length > 0
@@ -85,12 +86,14 @@ async function startPersistent(ctx, exec, backend, config) {
   const cols = positiveInteger('shells.cmd.cols', config.shells?.cmd?.cols, DEFAULT_COLS)
   const rows = positiveInteger('shells.cmd.rows', config.shells?.cmd?.rows, DEFAULT_ROWS)
   const graceMs = positiveInteger('shells.cmd.graceMs', config.shells?.cmd?.graceMs, DEFAULT_GRACE_MS)
+  const persistentEnv = assertEnvMap(config.shells?.env)
   const terminal = await ctx.subprocess.spawnTerminal({
     argv: persistentArgv(backend, config, codePage),
     cwd: commandWorkdir(undefined, exec),
     rows,
     cols,
     graceMs,
+    ...Object.keys(persistentEnv).length > 0 ? { env: persistentEnv } : {},
   })
   const session = {
     id: key,
@@ -207,6 +210,31 @@ function positiveInteger(name, value, fallback) {
   return resolved
 }
 
+/**
+ * Validate and return a `shells.env` map of extra environment entries injected
+ * into every command. A plain object with non-empty string keys is required;
+ * config mistakes fail here at load rather than silently under-executing.
+ * @param env - the configured `shells.env` value (undefined allowed).
+ * @returns the validated record, or an empty object when absent.
+ */
+function assertEnvMap(env) {
+  if (env === undefined || env === null) return {}
+  if (typeof env !== 'object' || Array.isArray(env)) {
+    throw new Error(`shells.env must be a map of KEY: VALUE, got ${JSON.stringify(env)}`)
+  }
+  const validated = {}
+  for (const [key, value] of Object.entries(env)) {
+    if (key.length === 0) {
+      throw new Error('shells.env: environment variable keys must be non-empty')
+    }
+    if (typeof value !== 'string') {
+      throw new Error(`shells.env: value for ${JSON.stringify(key)} must be a string, got ${JSON.stringify(value)}`)
+    }
+    validated[key] = value
+  }
+  return validated
+}
+
 function commandWorkdir(modelWorkdir, exec) {
   const workspace = exec.agent?.session.header.cwd
   if (modelWorkdir === undefined) return workspace ?? process.cwd()
@@ -297,6 +325,11 @@ function toolParameters(dialect) {
     },
     timeoutMs: { type: 'number', description: 'Timeout in milliseconds; defaults to 120000 and is capped at 600000.' },
     workdir: { type: 'string', description: 'Working directory; relative paths resolve against the session workspace.' },
+    probe: {
+      type: 'boolean',
+      description: 'Run a fast channel probe before the command (default: shells.<dialect>.probe). '
+        + 'On probe failure the tool returns immediately without running the command.',
+    },
     run_in_background: {
       type: 'boolean',
       description: 'Run the command in the background (fire-and-forget): the call returns a job id immediately; '
@@ -405,7 +438,7 @@ export function presentShellResult(args, result) {
   }
 }
 
-function registerCmd(ctx, config) {
+function registerCmd(ctx, config, extraEnv = {}) {
   const executable = assertExecutable(
     'cmd',
     config.executable ?? process.env.ComSpec ?? `${process.env.SystemRoot || 'C:\\Windows'}\\System32\\cmd.exe`,
@@ -432,6 +465,19 @@ function registerCmd(ctx, config) {
       const timeoutMs = positiveNumber('timeoutMs', args.timeoutMs, DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS)
       const timeout = AbortSignal.timeout(timeoutMs)
       const signal = AbortSignal.any([exec.signal, timeout])
+      // Fast channel probe (default per shells.cmd.probe): a lightweight plain
+      // spawn (no ConPTY needed for `echo`); failure skips the real command.
+      const probeEnabled = args.probe ?? config.probe ?? false
+      if (probeEnabled) {
+        const probe = await runProbeCheck(ctx, exec, (probeSignal) => ctx.subprocess.spawn({
+          argv: [executable, '/d', '/q', '/c', `echo ${PROBE_MARKER}`],
+          cwd: commandWorkdir(args.workdir, exec),
+          stdio: { stdin: 'ignore', stdout: { maxBytes: maxOutputBytes }, stderr: { maxBytes: maxOutputBytes } },
+          graceMs,
+          signal: probeSignal,
+        }))
+        if (!probe.ok) return probeFailureText('cmd', probe)
+      }
       // Fire-and-forget via the jobs registry; the terminal is started and its
       // output collected until `done`, so job_output can read the full result.
       if (args.run_in_background === true) {
@@ -443,6 +489,7 @@ function registerCmd(ctx, config) {
             cols,
             graceMs,
             signal,
+            ...Object.keys(extraEnv).length > 0 ? { env: extraEnv } : {},
           })
           const chunks = []
           let bytes = 0
@@ -482,6 +529,7 @@ function registerCmd(ctx, config) {
           cols,
           graceMs,
           signal,
+          ...Object.keys(extraEnv).length > 0 ? { env: extraEnv } : {},
         })
         const chunks = []
         let bytes = 0
@@ -529,6 +577,47 @@ function finalText(reader) {
   return reader?.readFrom(0).text ?? ''
 }
 
+const PROBE_MARKER = 'dsh-probe-ok'
+
+/** Model-facing text for a failed channel probe: names the shell and the fact. */
+function probeFailureText(dialect, probe) {
+  const detail = probe.error ?? (probe.stderr.trim() || probe.stdout.trim() || `exit code ${probe.exitCode}`)
+  return `[probe failed] ${dialect} channel unavailable: ${detail}`
+}
+
+/**
+ * Fast channel probe shared by every shell: spawn one lightweight command that
+ * prints `PROBE_MARKER`, fail fast (short deadline) when the executable or the
+ * environment is unusable so the real command never starts. Returns the probe
+ * facts; the caller decides how to present a failure.
+ */
+async function runProbeCheck(ctx, exec, makeSpawn, timeoutMs = 8000) {
+  const started = Date.now()
+  const timeout = AbortSignal.timeout(timeoutMs)
+  const signal = AbortSignal.any([exec.signal, timeout])
+  let running
+  try {
+    running = makeSpawn(signal)
+  } catch (err) {
+    return { ok: false, error: err.message, durationMs: Date.now() - started }
+  }
+  let outcome
+  try { outcome = await running.done } catch (err) {
+    return { ok: false, error: err.message, durationMs: Date.now() - started }
+  }
+  const stdout = finalText(running.collected.stdout)
+  const stderr = finalText(running.collected.stderr)
+  return {
+    ok: outcome.exitCode === 0 && stdout.includes(PROBE_MARKER),
+    timedOut: timeout.aborted && !exec.signal.aborted,
+    exitCode: outcome.exitCode,
+    signal: outcome.signal,
+    stdout,
+    stderr,
+    durationMs: Date.now() - started,
+  }
+}
+
 /**
  * Run one shell execution through the middleware chain registered in the
  * `shellMiddlewareSlot` service, then the core. The slot is provided by
@@ -548,11 +637,13 @@ function runShellChain(ctx, exec, args, core) {
   return dispatch(0)
 }
 
-function registerBash(ctx, config) {
+function registerBash(ctx, config, extraEnv = {}) {
   const executable = resolveBashExecutable(config.executable)
   const maxOutputBytes = positiveInteger('shells.bash.maxOutputBytes', config.maxOutputBytes, DEFAULT_MAX_OUTPUT_BYTES)
   const maxSpillBytes = positiveInteger('shells.bash.maxSpillBytes', config.maxSpillBytes, DEFAULT_MAX_SPILL_BYTES)
   const graceMs = positiveInteger('shells.bash.graceMs', config.graceMs, DEFAULT_GRACE_MS)
+  // clean-UTF-8 locale default, with an explicit shells.env entry winning.
+  const spawnEnv = { LANG: config.lang ?? 'C.UTF-8', LC_ALL: config.lang ?? 'C.UTF-8', ...extraEnv }
 
   ctx.tools.register(defineTool({
     name: config.toolName ?? 'bash',
@@ -571,6 +662,21 @@ function registerBash(ctx, config) {
       const timeout = AbortSignal.timeout(timeoutMs)
       const signal = AbortSignal.any([exec.signal, timeout])
       const collect = { maxBytes: maxOutputBytes, spill: { maxBytes: maxSpillBytes } }
+      // Fast channel probe (default per shells.bash.probe): fail immediately
+      // when the executable or environment is unusable, before starting the
+      // real command or the background job.
+      const probeEnabled = args.probe ?? config.probe ?? true
+      if (probeEnabled) {
+        const probe = await runProbeCheck(ctx, exec, (probeSignal) => ctx.subprocess.spawn({
+          argv: [executable, '--noprofile', '--norc', '-lc', `printf ${PROBE_MARKER}`],
+          cwd: commandWorkdir(args.workdir, exec),
+          stdio: { stdin: 'ignore', stdout: collect, stderr: collect },
+          graceMs,
+          signal: probeSignal,
+          env: spawnEnv,
+        }))
+        if (!probe.ok) return probeFailureText('bash', probe)
+      }
       // Fire-and-forget: register with the jobs service and return the id now.
       if (args.run_in_background === true) {
         return runShellChain(ctx, exec, args, async () => {
@@ -580,7 +686,7 @@ function registerBash(ctx, config) {
             stdio: { stdin: 'ignore', stdout: collect, stderr: collect },
             graceMs,
             signal,
-            env: { LANG: config.lang ?? 'C.UTF-8', LC_ALL: config.lang ?? 'C.UTF-8' },
+            env: spawnEnv,
           })
           const jobId = startBackground(ctx, exec, args.command, () => ({
             cancel: () => void running.terminate(),
@@ -603,7 +709,7 @@ function registerBash(ctx, config) {
           stdio: { stdin: 'ignore', stdout: collect, stderr: collect },
           graceMs,
           signal,
-          env: { LANG: config.lang ?? 'C.UTF-8', LC_ALL: config.lang ?? 'C.UTF-8' },
+          env: spawnEnv,
         })
         const outcome = await running.done
         return {
@@ -647,7 +753,7 @@ export function resolvePwshExecutable(configured, env = process.env) {
   return 'pwsh'
 }
 
-function registerPwsh(ctx, config) {
+function registerPwsh(ctx, config, extraEnv = {}) {
   const executable = resolvePwshExecutable(config.executable)
   const maxOutputBytes = positiveInteger('shells.pwsh.maxOutputBytes', config.maxOutputBytes, DEFAULT_MAX_OUTPUT_BYTES)
   const maxSpillBytes = positiveInteger('shells.pwsh.maxSpillBytes', config.maxSpillBytes, DEFAULT_MAX_SPILL_BYTES)
@@ -671,6 +777,20 @@ function registerPwsh(ctx, config) {
       const timeout = AbortSignal.timeout(timeoutMs)
       const signal = AbortSignal.any([exec.signal, timeout])
       const collect = { maxBytes: maxOutputBytes, spill: { maxBytes: maxSpillBytes } }
+      // Fast channel probe (default per shells.pwsh.probe): fail immediately
+      // when the executable or environment is unusable.
+      const probeEnabled = args.probe ?? config.probe ?? false
+      if (probeEnabled) {
+        const probe = await runProbeCheck(ctx, exec, (probeSignal) => ctx.subprocess.spawn({
+          argv: [executable, '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', `Write-Output ${PROBE_MARKER}`],
+          cwd: commandWorkdir(args.workdir, exec),
+          stdio: { stdin: 'ignore', stdout: collect, stderr: collect },
+          graceMs,
+          signal: probeSignal,
+          ...Object.keys(extraEnv).length > 0 ? { env: extraEnv } : {},
+        }))
+        if (!probe.ok) return probeFailureText('pwsh', probe)
+      }
       if (args.run_in_background === true) {
         return runShellChain(ctx, exec, args, async () => {
           const running = ctx.subprocess.spawn({
@@ -679,6 +799,7 @@ function registerPwsh(ctx, config) {
             stdio: { stdin: 'ignore', stdout: collect, stderr: collect },
             graceMs,
             signal,
+            ...Object.keys(extraEnv).length > 0 ? { env: extraEnv } : {},
           })
           const jobId = startBackground(ctx, exec, args.command, () => ({
             cancel: () => void running.terminate(),
@@ -698,6 +819,7 @@ function registerPwsh(ctx, config) {
           stdio: { stdin: 'ignore', stdout: collect, stderr: collect },
           graceMs,
           signal,
+          ...Object.keys(extraEnv).length > 0 ? { env: extraEnv } : {},
         })
         const outcome = await running.done
         return {
@@ -715,7 +837,357 @@ function registerPwsh(ctx, config) {
   }))
 }
 
-export function applyShells(ctx, config = {}, report = () => {}, readSettings = undefined) {
+// ══════════════════════════════════════════════════════════════════════
+// WSL shell (`shells.wsl.enabled`): structured WSL control tools
+// ══════════════════════════════════════════════════════════════════════
+
+/** Single-quote a value for safe embedding in a generated bash line (no shell interpretation). */
+function shq(value) {
+  return "'" + String(value).replace(/'/g, "'\\''") + "'"
+}
+
+/** Best-effort Windows → WSL path conversion (`D:\a\b` → `/mnt/d/a/b`); WSL paths pass through. */
+function toWslPath(p) {
+  if (p.startsWith('/')) return p
+  const m = /^([a-zA-Z]):[\\/](.*)$/.exec(p)
+  if (m) return `/mnt/${m[1].toLowerCase()}/${m[2].replace(/\\/g, '/')}`
+  return p
+}
+
+function wslExePath() {
+  return process.env.SystemRoot ? `${process.env.SystemRoot}\\System32\\wsl.exe` : 'C:\\Windows\\System32\\wsl.exe'
+}
+
+function wslArgsFor(distro, rest) {
+  const args = []
+  if (distro) args.push('-d', distro)
+  args.push('--')
+  args.push(...rest)
+  return args
+}
+
+function mergeChunks(chunks) {
+  let total = 0
+  for (const c of chunks) total += c.length
+  const out = Buffer.allocUnsafe(total)
+  let offset = 0
+  for (const c of chunks) { out.set(c, offset); offset += c.length }
+  return out
+}
+
+/** Collect one pipe stream to bytes; resolves at stream end. */
+function readAll(stream) {
+  return new Promise((resolve, reject) => {
+    const chunks = []
+    stream.on('data', (c) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)))
+    stream.on('end', () => resolve(mergeChunks(chunks)))
+    stream.on('error', reject)
+  })
+}
+
+/**
+ * Decode wsl.exe output bytes: its own console output is UTF-16LE while Linux
+ * command output is byte-transparent (normally UTF-8). Detect UTF-16LE by
+ * sampling odd-indexed null bytes; otherwise decode as UTF-8.
+ */
+function decodeWsl(bytes) {
+  if (!bytes || bytes.length === 0) return ''
+  const limit = Math.min(bytes.length, 256)
+  let nulls = 0
+  let total = 0
+  for (let i = 1; i < limit; i += 2) { total++; if (bytes[i] === 0) nulls++ }
+  if (total >= 4 && nulls / total >= 0.5) {
+    try { return bytes.toString('utf16le') } catch { /* fallthrough */ }
+  }
+  return bytes.toString('utf8')
+}
+
+/** Build the bash script piped to `wsl.exe -d <distro> -- bash -s` over stdin. */
+function buildWslScript({ cwd, env, argv, script }) {
+  const lines = []
+  if (cwd) {
+    lines.push(`cd ${shq(cwd)} || { printf "[wslctl] cd failed: ${cwd}\n" >&2; exit 126; }`)
+  }
+  if (env) {
+    for (const key of Object.keys(env)) lines.push(`export ${shq(key)}=${shq(env[key])}`)
+  }
+  if (argv) {
+    lines.push(`exec ${argv.map(shq).join(' ')}`)
+  } else if (script !== undefined) {
+    lines.push(script)
+  }
+  return lines.join('\n')
+}
+
+/**
+ * Register the four WSL tools. `wsl_exec` shares the plugin's run_in_background
+ * (fire-and-forget via `ctx.jobs`) and exit-status conventions with bash/cmd/pwsh,
+ * adds a channel probe (`probe: false` to disable) that fails fast before the
+ * command, and returns structured JSON (probe phase + command phase).
+ */
+function registerWsl(ctx, config, extraEnv = {}) {
+  const maxOutputBytes = positiveInteger('shells.wsl.maxOutputBytes', config.maxOutputBytes, DEFAULT_MAX_OUTPUT_BYTES)
+  const maxSpillBytes = positiveInteger('shells.wsl.maxSpillBytes', config.maxSpillBytes, DEFAULT_MAX_SPILL_BYTES)
+  const graceMs = positiveInteger('shells.wsl.graceMs', config.graceMs, DEFAULT_GRACE_MS)
+  const probeTimeoutMs = positiveInteger('shells.wsl.probeTimeoutMs', config.probeTimeoutMs, 15000)
+  const mainName = config.toolName ?? 'wsl_exec'
+
+  const renderJson = {
+    schema: { type: 'json' },
+    render: (_args, value) => [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value, null, 2) }],
+  }
+
+  const wslSpawnCwd = (exec) => exec?.agent?.session?.header?.cwd ?? process.cwd()
+
+  /** Fast channel probe: `wsl.exe -d <distro> -- printf wslctl-probe-ok`. */
+  async function runProbe(exec, distro, timeoutMs) {
+    const started = Date.now()
+    const timeout = AbortSignal.timeout(timeoutMs)
+    const signal = AbortSignal.any([exec.signal, timeout])
+    let handle
+    try {
+      handle = ctx.subprocess.spawn({
+        argv: [wslExePath(), ...wslArgsFor(distro, ['printf', 'wslctl-probe-ok'])],
+        cwd: wslSpawnCwd(exec),
+        stdio: { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' },
+        graceMs,
+        signal,
+      })
+    } catch (err) {
+      return { ok: false, error: err.message, durationMs: Date.now() - started }
+    }
+    const [outBuf, errBuf] = await Promise.all([readAll(handle.stdout), readAll(handle.stderr)])
+    let outcome
+    try { outcome = await handle.done } catch (err) {
+      return { ok: false, error: err.message, stdout: decodeWsl(outBuf), stderr: decodeWsl(errBuf), durationMs: Date.now() - started }
+    }
+    return {
+      ok: outcome.exitCode === 0 && decodeWsl(outBuf).includes('wslctl-probe-ok'),
+      timedOut: timeout.aborted && !exec.signal.aborted,
+      exitCode: outcome.exitCode,
+      signal: outcome.signal,
+      stdout: decodeWsl(outBuf),
+      stderr: decodeWsl(errBuf),
+      durationMs: Date.now() - started,
+    }
+  }
+
+  /** Foreground execution: `wsl.exe -d <distro> -- bash -s` with the script on stdin. */
+  async function runWsl(exec, args, script, distro, timeoutMsArg) {
+    const started = Date.now()
+    const timeoutMs = positiveNumber('timeoutMs', timeoutMsArg, DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS)
+    const timeout = AbortSignal.timeout(timeoutMs)
+    const signal = AbortSignal.any([exec.signal, timeout])
+    let handle
+    try {
+      handle = ctx.subprocess.spawn({
+        argv: [wslExePath(), ...wslArgsFor(distro, args)],
+        cwd: wslSpawnCwd(exec),
+        stdio: { stdin: { data: script }, stdout: 'pipe', stderr: 'pipe' },
+        graceMs,
+        signal,
+      })
+    } catch (err) {
+      return { status: 'spawn-error', message: err.message }
+    }
+    const [outBuf, errBuf] = await Promise.all([readAll(handle.stdout), readAll(handle.stderr)])
+    let outcome
+    try { outcome = await handle.done } catch (err) {
+      return { status: 'spawn-error', message: err.message, stdout: decodeWsl(outBuf), stderr: decodeWsl(errBuf), durationMs: Date.now() - started }
+    }
+    return {
+      status: outcome.signal ? 'signal' : 'exited',
+      exitCode: outcome.exitCode,
+      signal: outcome.signal,
+      stdout: decodeWsl(outBuf),
+      stderr: decodeWsl(errBuf),
+      durationMs: Date.now() - started,
+      timedOut: timeout.aborted && !exec.signal.aborted,
+    }
+  }
+
+  ctx.tools.register(defineTool({
+    name: 'wsl_probe',
+    description: '快速探测 WSL 通道是否可用（指定发行版存在且 wsl.exe 可启动），通常 1-3 秒返回，失败立即返回诊断。'
+      + '长任务/批量命令前可先探测。返回 { ok, distro, timedOut, exitCode, signal, stdout, stderr, durationMs }。',
+    parameters: {
+      distro: { type: 'string', description: 'WSL 发行版名，缺省用默认发行版' },
+    },
+    output: renderJson,
+    // The tool guard must outlive the subprocess deadline so runProbe can
+    // collect the process result and return structured timeout diagnostics.
+    timeoutMs: probeTimeoutMs + 5000,
+    isConcurrencySafe: () => true,
+    async execute(args, exec) {
+      assertFullAccess(ctx, exec, 'wsl_probe')
+      const probe = await runProbe(exec, args.distro, probeTimeoutMs)
+      return { ...probe, distro: args.distro ?? null }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'wsl_info',
+    description: '枚举本机 WSL 发行版、状态、默认发行版与 WSL 版本。返回结构化 JSON：'
+      + '{ available, defaultDistro, version, distros: [{name,state,version,default}], raw }。',
+    parameters: {},
+    output: renderJson,
+    timeoutMs: 15000,
+    isConcurrencySafe: () => true,
+    async execute(_args, exec) {
+      assertFullAccess(ctx, exec, 'wsl_info')
+      const started = Date.now()
+      let handle
+      try {
+        handle = ctx.subprocess.spawn({
+          argv: [wslExePath(), '-l', '-v'],
+          cwd: wslSpawnCwd(exec),
+          stdio: { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' },
+          graceMs,
+          signal: exec.signal,
+        })
+      } catch (err) {
+        return { available: false, error: err.message }
+      }
+      const [outBuf, errBuf] = await Promise.all([readAll(handle.stdout), readAll(handle.stderr)])
+      let outcome
+      try { outcome = await handle.done } catch (err) {
+        return { available: false, error: err.message }
+      }
+      const raw = decodeWsl(outBuf)
+      const lines = raw.split(/\r?\n/).map((l) => l.replace(/\s+/g, ' ').trim()).filter(Boolean)
+      const distros = []
+      let defaultDistro = null
+      for (const line of lines) {
+        if (/^NAME\s+STATE/.test(line) || /^名称/.test(line)) continue
+        const m = /^(\*?)\s*(.+?)\s+(\S+)\s+(\d+)\s*$/.exec(line)
+        if (!m) continue
+        const isDefault = m[1] === '*'
+        if (isDefault) defaultDistro = m[2]
+        distros.push({ name: m[2], state: m[3].toLowerCase(), version: Number(m[4]), default: isDefault })
+      }
+      return {
+        available: outcome.exitCode === 0,
+        defaultDistro,
+        version: distros.length > 0 ? Math.max(...distros.map((d) => d.version)) : null,
+        distros,
+        warnings: decodeWsl(errBuf).trim() ? [decodeWsl(errBuf).trim()] : [],
+        raw,
+        durationMs: Date.now() - started,
+      }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: mainName,
+    description: '在 WSL 发行版中执行命令。默认先快速探测通道（probe），失败立即返回 probe-failed 不执行命令；'
+      + '成功则结果附带 probe 字段（阶段化返回）。两种模式：argv（参数数组，无 shell 解释，推荐）或 script（shell 脚本，经 stdin 传递无命令行转义）。'
+      + 'cwd 支持 windows 路径（自动转 /mnt/<drive>）与 wsl 路径；env 在脚本内 export。'
+      + 'run_in_background=true 时注册为宿主后台作业返回 job id，用 job_output 增量读、job_kill 终止（与 bash/cmd/pwsh 同模式）。'
+      + '返回 { status, exitCode, signal, stdout, stderr, durationMs, distro, resolvedCwd, probe }。',
+    parameters: {
+      distro: { type: 'string', description: 'WSL 发行版名，缺省用默认发行版' },
+      argv: { type: 'array', items: { type: 'string' }, description: '命令参数数组，argv[0] 为 Linux 可执行文件（与 script 互斥，推荐）' },
+      script: { type: 'string', description: 'shell 脚本文本（与 argv 互斥）' },
+      cwd: { type: 'string', description: '工作目录：windows 路径（D:\\x）或 wsl 路径（/home/x），缺省继承当前目录' },
+      cwdFormat: { type: 'string', enum: ['auto', 'windows', 'wsl'], description: 'cwd 解释方式，缺省 auto（/ 开头视为 wsl 路径，否则按 windows 转换）' },
+      env: { type: 'object', additionalProperties: true, description: '注入的环境变量（脚本内 export）' },
+      probe: { type: 'boolean', description: '执行前先探测 WSL 通道（默认 per shells.wsl.probe），探测失败立即返回 probe-failed' },
+      timeoutMs: { type: 'number', description: 'Timeout in milliseconds; defaults to 120000 and is capped at 600000.' },
+      run_in_background: {
+        type: 'boolean',
+        description: 'Run in the background (fire-and-forget): returns a job id; poll with `job_output`, stop with `job_kill`.',
+      },
+    },
+    output: renderJson,
+    timeoutMs: 120000,
+    isConcurrencySafe: () => true,
+    async execute(args, exec) {
+      assertFullAccess(ctx, exec, mainName)
+      const hasArgv = Array.isArray(args.argv) && args.argv.length > 0
+      const hasScript = typeof args.script === 'string'
+      if (hasArgv === hasScript) {
+        return { status: 'arg-error', message: 'argv（非空数组）与 script（字符串）必须且只能提供一个' }
+      }
+      let cwd
+      if (args.cwd) {
+        const fmt = args.cwdFormat ?? 'auto'
+        if (fmt === 'wsl') cwd = args.cwd
+        else if (fmt === 'windows') cwd = toWslPath(args.cwd)
+        else cwd = args.cwd.startsWith('/') ? args.cwd : toWslPath(args.cwd)
+      }
+      const script = buildWslScript({ cwd, env: args.env, argv: hasArgv ? args.argv : undefined, script: hasScript ? args.script : undefined })
+      let probe = null
+      if (args.probe ?? config.probe ?? true) {
+        probe = await runProbe(exec, args.distro, probeTimeoutMs)
+        if (!probe.ok) {
+          return {
+            status: 'probe-failed',
+            probe,
+            message: 'WSL 通道探测失败，未执行命令。',
+            distro: args.distro ?? null,
+            resolvedCwd: cwd ?? null,
+          }
+        }
+      }
+      const label = hasArgv ? `wsl ${args.argv.join(' ')}`.slice(0, 120) : `wsl script: ${(args.script.split('\n')[0] ?? '').trim()}`.slice(0, 120)
+      if (args.run_in_background === true) {
+        const collect = { maxBytes: maxOutputBytes, spill: { maxBytes: maxSpillBytes } }
+        const running = ctx.subprocess.spawn({
+          argv: [wslExePath(), ...wslArgsFor(args.distro, ['bash', '-s'])],
+          cwd: wslSpawnCwd(exec),
+          stdio: { stdin: { data: script }, stdout: collect, stderr: collect },
+          graceMs,
+          signal: exec.signal,
+        })
+        const jobId = startBackground(ctx, exec, label, () => ({
+          cancel: () => void running.terminate(),
+          done: running.done.then((outcome) => {
+            running.outcome = outcome
+            return shellOutcome(outcome)
+          }),
+          readOutput: () => backgroundText(running),
+        }), 'wsl')
+        return `started background job ${jobId}`
+      }
+      const result = await runWsl(exec, ['bash', '-s'], script, args.distro, args.timeoutMs)
+      return { ...result, distro: args.distro ?? null, resolvedCwd: cwd ?? null, probe }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'wsl_path',
+    description: '在 Windows 路径与 WSL 路径之间转换（基于 WSL 内 wslpath，处理 UNC/符号链接等边界）。'
+      + 'windows-to-wsl：D:\\foo → /mnt/d/foo；wsl-to-windows：/home/x → \\\\wsl.localhost\\<distro>\\... 返回 { path, kind }。',
+    parameters: {
+      path: { type: 'string', required: true, description: '要转换的路径' },
+      direction: { type: 'string', required: true, enum: ['windows-to-wsl', 'wsl-to-windows'], description: '转换方向' },
+      distro: { type: 'string', description: 'WSL 发行版名，缺省用默认' },
+    },
+    output: renderJson,
+    timeoutMs: 15000,
+    isConcurrencySafe: () => true,
+    async execute(args, exec) {
+      assertFullAccess(ctx, exec, 'wsl_path')
+      const flag = args.direction === 'windows-to-wsl' ? '-a' : '-w'
+      // wsl.exe's direct command line is interpreted by the distro shell, so a
+      // Windows path such as D:\\Programs\\x would lose its backslashes. Pass
+      // wslpath through bash stdin with the same single-quote escaping used by
+      // wsl_exec argv mode.
+      const script = buildWslScript({ argv: ['wslpath', flag, args.path] })
+      const result = await runWsl(exec, ['bash', '-s'], script, args.distro, 15000)
+      if (result.status !== 'exited' || result.exitCode !== 0) {
+        return { error: result.stderr || result.stdout || result.message || `wslpath 退出码 ${result.exitCode}`, detail: result }
+      }
+      const value = result.stdout.trim()
+      return {
+        path: value,
+        kind: args.direction === 'windows-to-wsl' ? (value.startsWith('/mnt/') ? 'drvfs' : 'wsl-filesystem') : 'windows',
+      }
+    },
+  }))
+}
+
+export function applyShells(ctx, config = {}, report = () => {}) {
   // ── Middleware slot ─────────────────────────────────────────────────────
   // This plugin provides a REGISTRATION POINT (slot), not measurement logic.
   // Any middleware (e.g. perf-hook) registers a function here; it is then
@@ -766,38 +1238,28 @@ export function applyShells(ctx, config = {}, report = () => {}, readSettings = 
   const cmd = shells.cmd ?? { enabled: true }
   const bash = shells.bash ?? { enabled: false }
   const pwsh = shells.pwsh ?? { enabled: false }
-  if (cmd.enabled !== true && bash.enabled !== true && pwsh.enabled !== true) {
-    report('configuration', new Error('enable at least one of shells.cmd, shells.bash or shells.pwsh'))
+  const wsl = shells.wsl ?? { enabled: false }
+  // Shared extra environment injected into every command across all shells
+  // (PyCharm-style common presets, e.g. PYTHONIOENCODING=utf-8 on Windows).
+  const extraEnv = assertEnvMap(shells.env)
+  if (cmd.enabled !== true && bash.enabled !== true && pwsh.enabled !== true && wsl.enabled !== true) {
+    report('configuration', new Error('enable at least one of shells.cmd, shells.bash, shells.pwsh or shells.wsl'))
     return { registered: [], failed: ['configuration'] }
   }
 
   // ── Model-facing shell-availability constraint ──────────────────────────
-  // Mirrors the `user:language` injection pattern: a dynamic system-prompt
-  // section re-evaluated at every assembly, so enabling/disabling a shell in
-  // the settings page is reflected on the next turn without a restart. When
-  // `readSettings` is provided (the settings scope), live values win over the
-  // startup config. Any evaluation failure degrades to an empty paragraph.
+  // The entry Config is current configuration. 0.2 settings writes persist into
+  // the profile layer; a reload invokes apply again with the updated Config.
   const persistentConfig = config.persistent ?? { enabled: false }
   const availability = () => {
     try {
-      let flags
-      if (readSettings !== undefined) {
-        const live = readSettings()
-        if (live !== null && typeof live === 'object') {
-          flags = { ...live, persistentEnabled: persistentConfig.enabled === true }
-        }
-      }
-      // A missing or malformed settings read falls back to the startup config
-      // rather than emitting a misleading all-disabled paragraph.
-      if (flags === undefined) {
-        flags = {
-          cmdEnabled: cmd.enabled === true,
-          bashEnabled: bash.enabled === true,
-          pwshEnabled: pwsh.enabled === true,
-          persistentEnabled: persistentConfig.enabled === true,
-        }
-      }
-      return shellAvailabilityText(flags)
+      return shellAvailabilityText({
+        cmdEnabled: cmd.enabled === true,
+        bashEnabled: bash.enabled === true,
+        pwshEnabled: pwsh.enabled === true,
+        wslEnabled: wsl.enabled === true,
+        persistentEnabled: persistentConfig.enabled === true,
+      })
     } catch (error) {
       report('system-prompt', error)
       return ''
@@ -889,7 +1351,7 @@ export function applyShells(ctx, config = {}, report = () => {}, readSettings = 
 
   if (cmd.enabled === true) {
     try {
-      registerCmd(ctx, cmd)
+      registerCmd(ctx, cmd, extraEnv)
       registered.push(cmd.toolName ?? 'cmd')
     } catch (error) {
       failed.push(cmd.toolName ?? 'cmd')
@@ -898,7 +1360,7 @@ export function applyShells(ctx, config = {}, report = () => {}, readSettings = 
   }
   if (bash.enabled === true) {
     try {
-      registerBash(ctx, bash)
+      registerBash(ctx, bash, extraEnv)
       registered.push(bash.toolName ?? 'bash')
     } catch (error) {
       failed.push(bash.toolName ?? 'bash')
@@ -907,11 +1369,20 @@ export function applyShells(ctx, config = {}, report = () => {}, readSettings = 
   }
   if (pwsh.enabled === true) {
     try {
-      registerPwsh(ctx, pwsh)
+      registerPwsh(ctx, pwsh, extraEnv)
       registered.push(pwsh.toolName ?? 'pwsh')
     } catch (error) {
       failed.push(pwsh.toolName ?? 'pwsh')
       report(pwsh.toolName ?? 'pwsh', error)
+    }
+  }
+  if (wsl.enabled === true) {
+    try {
+      registerWsl(ctx, wsl, extraEnv)
+      registered.push(wsl.toolName ?? 'wsl_exec')
+    } catch (error) {
+      failed.push(wsl.toolName ?? 'wsl_exec')
+      report(wsl.toolName ?? 'wsl_exec', error)
     }
   }
   return { registered, failed }

@@ -25,6 +25,25 @@
 （通过 `ctx.jobs` 即发即弃），可选的 `persistent.enabled` 配置则暴露一个
 per-agent 持久化的 `shell_session` 工具。
 
+### 通用环境变量注入（`shells.env` / 设置页）
+
+注入到全部三个 shell（以及持久化会话）每条命令的环境变量——即 PyCharm 式的
+"环境变量预设"，与单个 shell 无关。**Shell 设置页提供键值对编辑器**（`环境变量`
+字段，路径持久化为 `shell-plugin-local` entry config 的 `shells.env`）；
+部署方也可在 `cordis.patch.yml` 里预置默认：
+
+```yaml
+shells:
+  env:
+    PYTHONIOENCODING: 'utf-8'   # Python stdio 输出 UTF-8，而非 GBK 控制台代码页
+    PYTHONUTF8: '1'             # Python 3.7+ UTF-8 模式
+```
+
+`bash` 仍在其下叠加 `lang` 默认值（`LANG`/`LC_ALL`，默认 `C.UTF-8`），因此显式的
+`LANG` 条目会覆盖默认 locale；`cmd` 与 `pwsh` 只继承这些条目（它们各自的控制台代码页
+分别由 `shells.cmd.codePage` 与 `-Command` 的 UTF-8 输出前导处理）。非法值会在加载时
+明文报错：映射必须是「非空字符串键 → 字符串值」。
+
 ## 失败隔离
 
 bundle 根 Loader 入口只 import 一个无依赖的 supervisor。该 supervisor 动态
@@ -62,22 +81,60 @@ PowerShell 不适合模型的 RL/tool 环境。`pwsh-sandbox` EXECUTOR 行被有
 Program Files 下第一个存在的 `pwsh.exe`，其次 System32 下的 Windows PowerShell
 5.1，再回退 PATH）、`maxOutputBytes`、`maxSpillBytes`、`graceMs`。
 
-设置页（Shell 小节）暴露两个控件：`cmdEnabled`、`bashEnabled`、`pwshEnabled`
-和 `pwshExecutable` 持久化到 `local-shell-tools` settings 命名空间，并在下次
-DSH 重启时合并进工具配置。想找回系统 PowerShell 工具的部署，可从本 bundle 的
+设置页（Shell 小节）编辑对应的嵌套字段（`shells.cmd.enabled`、
+`shells.bash.enabled`、`shells.pwsh.enabled`、`shells.pwsh.executable` 等），
+它们直接持久化到 `shell-plugin-local` entry config，并在下次 DSH 重启时生效。想找回系统 PowerShell 工具的部署，可从本 bundle 的
 `cordis.patch.yml` 移除 `tool-pwsh` 行；只想用本插件 PowerShell 的部署，改启用
 `shells.pwsh` 即可。
 
 ## 后台执行（即发即弃）
 
-每个注册的 shell 工具（`cmd`、`bash`、`pwsh`）都接受 `run_in_background: true`。
-调用会把进程注册到 harness 的 `ctx.jobs` 服务并立即返回 job id
-（`started background job <id>`）；模型随后可用 `job_output`（或带 `wait: true`
-的 `job_output`）轮询，用 `job_kill` 停止。进程结束时，jobs 服务自动向所属
-会话投递完成通知——这就是长任务的即发即弃模式。
+每个注册的 shell 工具（`cmd`、`bash`、`pwsh`、`wsl_exec`）都接受
+`run_in_background: true`。调用会把进程注册到 harness 的 `ctx.jobs` 服务并立即
+返回 job id（`started background job <id>`）；模型随后可用 `job_output`（或带
+`wait: true` 的 `job_output`）轮询，用 `job_kill` 停止。进程结束时，jobs 服务
+自动向所属会话投递完成通知——这就是长任务的即发即弃模式。
 
 后台进程由所属 agent 栅栏隔离（agent 销毁时取消并等待它们），并在插件 fiber
 拆除时被 kill/join。
+
+## 通道探测
+
+每个 shell 工具（`bash`、`cmd`、`pwsh`、`wsl_exec`）都可以在执行真实命令前先跑
+一次快速通道探测：一条轻量命令打印标记（bash 用 `printf dsh-probe-ok`，cmd 用
+`echo dsh-probe-ok`，pwsh 用 `Write-Output dsh-probe-ok`，wsl 在发行版内用
+`printf wslctl-probe-ok`）。探测失败时工具立即返回（`[probe failed]
+<dialect> channel unavailable: <诊断>`，wsl 为 `probe-failed`），而不是等到命令
+超时——可执行文件或通道坏了只浪费几秒而不是几分钟。
+
+探测是每个 shell 的可选开关：`shells.<name>.probe`（默认：`bash` 与 `wsl` 开，
+`cmd` 与 `pwsh` 关——与默认启用的 shell 集合一致），单次调用可用 `probe:
+true|false` 参数覆盖配置，设置页也暴露全部四个 `*Probe` 开关。wsl 的探测还会
+顺带预热发行版，使后续命令免于冷启动等待。
+
+## WSL 支持（`shells.wsl.enabled`）
+
+`shells.wsl.enabled: true` 注册四个结构化的 WSL 控制工具：
+
+- `wsl_info` — 枚举发行版、状态、默认发行版与 WSL 版本（解析 `wsl.exe -l -v`，
+  处理其 UTF-16LE 控制台输出）；
+- `wsl_exec` — 在 WSL 发行版中执行命令，两种模式：`argv`（参数数组，无 shell
+  解释，推荐）或 `script`（shell 脚本经 stdin 传递，无命令行转义）。`cwd` 接受
+  windows 路径（自动转 `/mnt/<drive>`）或 wsl 路径；`env` 在脚本内 export；
+  支持 `run_in_background: true`（与其他 shell 同模式）；
+- `wsl_path` — 基于 WSL 内 wslpath 的双向路径转换（`D:\foo` → `/mnt/d/foo`，
+  `/home/x` → `\\wsl.localhost\<distro>\...`）；
+- `wsl_probe` — 快速通道探测（约 1-3 秒），适合长任务/批量命令前预检。
+
+`wsl_exec` 默认在执行真实命令前先探测通道：探针（`wsl.exe -d <distro> --
+printf wslctl-probe-ok`，由 `shells.wsl.probeTimeoutMs` 配置，默认 15 秒）会顺带
+预热发行版并快速失败——发行版不存在时
+返回 `probe-failed` 并携带 `WSL_E_DISTRO_NOT_FOUND` 诊断，而不是等到命令超时。
+命令结果附带 `probe` 字段，模型可分别读取探测阶段与命令阶段。传 `probe: false`
+跳过探测。
+
+WSL 工具返回结构化 JSON（不同于返回文本的 cmd/bash/pwsh）：
+`{ status, exitCode, signal, stdout, stderr, durationMs, distro, resolvedCwd, probe }`。
 
 ## 持久化 shell 会话
 
@@ -101,15 +158,13 @@ DSH 重启时合并进工具配置。想找回系统 PowerShell 工具的部署�
 shell 工具的唯一来源。为了让「启用集合」保持权威，插件注册了一个
 `shell:availability` 系统提示词段落，把模型约束到本部署实际启用的 shell。
 
-该段落列出启用的 shell（`cmd`/`bash`/`pwsh`，以及启用 `persistent.enabled` 时的
-`shell_session`），点名被禁用的，并禁止调用启用集合之外的任何 shell——即使其
-工具仍出现在 catalog 中。只有当至少一个 shell 被禁用时才渲染这段文字；当所有
+该段落列出启用的 shell（`cmd`/`bash`/`pwsh`/`wsl`，以及启用 `persistent.enabled`
+时的 `shell_session`），点名被禁用的，并禁止调用启用集合之外的任何 shell——即使
+其工具仍出现在 catalog 中。只有当至少一个 shell 被禁用时才渲染这段文字；当所有
 shell 都启用时无需约束，该段落不贡献任何文本。
 
-仿照 `user:language` 注入模式，段落文字在每次提示词组装时从实时
-`local-shell-tools` settings 重新求值，因此在设置页切换 `cmdEnabled`/
-`bashEnabled`/`pwshEnabled` 会在下一轮改变约束而无需重启。任何 settings 读取
-失败降级为启动配置，任何求值失败降级为空段落——注入绝不破坏提示词。
+段落文字由插件加载时的 entry Config 派生，因此在设置页切换 shell 启用标志后，
+需要重新加载/重启 entry 才会改变约束。任何求值失败降级为空段落——注入绝不破坏提示词。
 
 ## 输入 / 输出预览
 
